@@ -1,0 +1,138 @@
+name: Image Processor
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_id:
+        description: 'Google Drive File ID'
+        required: true
+      file_name:
+        description: 'File Name'
+        required: true
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pillow numpy requests google-auth google-auth-oauthlib google-api-python-client
+
+      - name: Download image from Drive
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+        run: |
+          python - << 'EOF'
+          import os, json, requests
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload
+          import io
+
+          creds_info = json.loads(os.environ['GDRIVE_CREDENTIALS'])
+          creds = service_account.Credentials.from_service_account_info(
+              creds_info, scopes=['https://www.googleapis.com/auth/drive'])
+          service = build('drive', 'v3', credentials=creds)
+
+          file_id = '${{ github.event.inputs.file_id }}'
+          file_name = '${{ github.event.inputs.file_name }}'
+
+          request = service.files().get_media(fileId=file_id)
+          with open(f'input_{file_name}', 'wb') as f:
+              downloader = MediaIoBaseDownload(f, request)
+              done = False
+              while not done:
+                  _, done = downloader.next_chunk()
+          print(f'Downloaded: {file_name}')
+          EOF
+
+      - name: Process image
+        run: |
+          python - << 'EOF'
+          import os
+          from PIL import Image, ImageDraw
+          import numpy as np
+
+          file_name = '${{ github.event.inputs.file_name }}'
+          src = f'input_{file_name}'
+          stem = os.path.splitext(file_name)[0]
+
+          def crop_product(src_path):
+              img = Image.open(src_path).convert("RGBA")
+              arr = np.array(img.convert("RGB"))
+              mask = ~((arr[:,:,0]>240)&(arr[:,:,1]>240)&(arr[:,:,2]>240))
+              rows = np.where(mask.any(axis=1))[0]
+              cols = np.where(mask.any(axis=0))[0]
+              if len(rows)==0: return None
+              return img.crop((cols.min(), rows.min(), cols.max()+1, rows.max()+1))
+
+          def make_instagram(img, out_path):
+              W, H = 1080, 1350
+              area_w = int(W*(1-154/1080-155/1080))
+              area_h = int(H*(1-293/1350-294/1350))
+              ox, oy = int(W*154/1080), int(H*293/1350)
+              scale = min(area_w/img.width, area_h/img.height)
+              nw, nh = int(img.width*scale), int(img.height*scale)
+              img_r = img.resize((nw, nh), Image.LANCZOS)
+              canvas = Image.new("RGB", (W, H), (255,255,255))
+              canvas.paste(img_r, (ox+(area_w-nw)//2, oy+(area_h-nh)//2), img_r)
+              canvas.save(out_path, "JPEG", quality=95)
+
+          def make_story_after(img, out_path):
+              W, H = 1125, 1990
+              pad_top = int(H*0.301)
+              area_w = int(W*(1-0.144-0.145))
+              area_h = int(H*0.397)
+              scale = min(area_w/img.width, area_h/img.height)
+              nw, nh = int(img.width*scale), int(img.height*scale)
+              img_r = img.resize((nw, nh), Image.LANCZOS)
+              x = 279
+              y = pad_top + (area_h - nh) // 2
+              canvas = Image.new("RGB", (W, H), (255,255,255))
+              canvas.paste(img_r, (x, y), img_r)
+              draw = ImageDraw.Draw(canvas)
+              draw.rounded_rectangle([379,1678,745,1736], radius=8, outline=(191,191,191), width=2)
+              canvas.save(out_path, "JPEG", quality=95)
+
+          img = crop_product(src)
+          make_instagram(img, f'{stem}_insta.jpg')
+          make_story_after(img, f'{stem}_story_after.jpg')
+          print('処理完了')
+          EOF
+
+      - name: Upload to Google Drive
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+          INSTA_FOLDER_ID: ${{ secrets.INSTA_FOLDER_ID }}
+          STORY_FOLDER_ID: ${{ secrets.STORY_FOLDER_ID }}
+        run: |
+          python - << 'EOF'
+          import os, json
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          creds_info = json.loads(os.environ['GDRIVE_CREDENTIALS'])
+          creds = service_account.Credentials.from_service_account_info(
+              creds_info, scopes=['https://www.googleapis.com/auth/drive'])
+          service = build('drive', 'v3', credentials=creds)
+
+          stem = os.path.splitext('${{ github.event.inputs.file_name }}')[0]
+
+          for fname, folder_id in [
+              (f'{stem}_insta.jpg', os.environ['INSTA_FOLDER_ID']),
+              (f'{stem}_story_after.jpg', os.environ['STORY_FOLDER_ID']),
+          ]:
+              media = MediaFileUpload(fname, mimetype='image/jpeg')
+              service.files().create(
+                  body={'name': fname, 'parents': [folder_id]},
+                  media_body=media
+              ).execute()
+              print(f'アップロード完了: {fname}')
+          EOF
